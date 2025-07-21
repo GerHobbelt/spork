@@ -555,8 +555,8 @@ typedef int mz_bool;
 #define MZ_TRUE (1)
 
 /* Works around MSVC's spammy "warning C4127: conditional expression is constant" message. */
-#ifdef _MSC_VER
-#define MZ_MACRO_END while (0, 0)
+#if defined(_MSC_VER) && 0
+#define MZ_MACRO_END while (0, 0)   // --> warning C4548: expression before comma has no effect; expected expression with side-effect
 #else
 #define MZ_MACRO_END while (0)
 #endif
