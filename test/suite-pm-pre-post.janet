@@ -81,7 +81,7 @@
        (def binpath (path/join (dyn *syspath*) "bin"))
        (def janet-pm (path/join binpath (string "janet-pm")))
        (assert (sh/exists? janet-pm))
-       (dump-out (sh/exec-slurp-all janet-pm "show-config"))
+       (dump-out (sh/exec-slurp-all (string janet-pm bat) "show-config"))
        (assert (= 1 (length (string/find-all "put root-env :install-time-syspath" (slurp janet-pm)))))
 
        # check sub commands work, even without defining pre-/post-
@@ -125,7 +125,7 @@
        (def bin-with-main (path/join binpath (string "bin-with-main")))
        (def bin-out (sh/exec-slurp-all (string bin-with-main bat)))
        (dump-out bin-out)
-       (assert (string/find (dyn *syspath*) (bin-out :out)))
+       (assert (string/find (path/basename (dyn *syspath*)) (bin-out :out)))
 
        # check "test"
        (divider "Running janet-pm test")
