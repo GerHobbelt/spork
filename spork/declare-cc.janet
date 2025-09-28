@@ -140,7 +140,7 @@
 (defmacro sh-phony
   "Alias for `sh-task`."
   [target deps & body]
-  ~(,rule-impl ,target ,deps (fn ,(keyword (firstt target)) [] (,sh/exec ;body)) true))
+  ~(,rule-impl ,target ,deps (fn ,(keyword (firstt target)) [] (,sh/exec ,;body)) true))
 
 (defn install-file-rule
   "Add install and uninstall rule for moving file from src into destdir."
@@ -266,11 +266,18 @@
   (def bd (build-dir))
   (def rules (get-rules))
   # Initialize build rules
-  (build-rules/build-rule rules :install ["build" "pre-install"])
+  (build-rules/build-rule rules :install [])
   (build-rules/build-rule rules :pre-install [])
+  (build-rules/build-rule rules :post-install [])
   (build-rules/build-rule rules :build [])
   (build-rules/build-rule rules :pre-build [])
+  (build-rules/build-rule rules :post-build [])
+  (build-rules/build-rule rules :check [])
   (build-rules/build-rule rules :pre-check [])
+  (build-rules/build-rule rules :post-check [])
+  (build-rules/build-rule rules :clean [])
+  (build-rules/build-rule rules :pre-clean [])
+  (build-rules/build-rule rules :post-clean [])
   # Add hooks
   (def e (curenv))
   (defn- prebuild
@@ -279,34 +286,59 @@
     (os/mkdir bd)
     (os/mkdir (path/join bd "static"))
     (build-rules/build-run e "pre-build" (dyn :workers)))
+  (defn- postbuild
+    []
+    (build-rules/build-run e "post-build" (dyn :workers)))
   (defn- precheck
     []
     (build-rules/build-run e "pre-check" (dyn :workers)))
+  (defn- postcheck
+    []
+    (build-rules/build-run e "post-check" (dyn :workers)))
+  (defn- preinstall
+    []
+    (build-rules/build-run e "pre-install" (dyn :workers)))
+  (defn- postinstall
+    []
+    (build-rules/build-run e "post-install" (dyn :workers)))
+  (defn- preclean
+    []
+    (build-rules/build-run e "pre-clean" (dyn :workers)))
+  (defn- postclean
+    []
+    (build-rules/build-run e "post-clean" (dyn :workers)))
   (defn build [&opt man target]
     (prebuild)
     (default target "build")
-    (build-rules/build-run e target (dyn :workers)))
+    (build-rules/build-run e target (dyn :workers))
+    (postbuild))
   (defn install [manifest &]
-    (build)
+    # (build) - removed since install in janet/src/boot/boot.janet calls build in the install hook
     (with-dyns [*install-manifest* manifest]
-      (build-rules/build-run e "install" (dyn :workers))))
+      (preinstall)
+      (build-rules/build-run e "install" (dyn :workers))
+      (postinstall)))
   (defn check [&]
     (build)
     (precheck)
-    (run-tests))
+    (run-tests)
+    (postcheck))
   (defn list-rules [&]
     (each k (sorted (filter string? (keys rules)))
       (print k)))
   (defn rule-tree [&]
     (show-rule-tree rules))
   (defn clean [&]
+    (preclean)
     (print "removing directory " bd)
-    (sh/rm bd))
+    (sh/rm bd)
+    (postclean))
   (defn clean-all [&]
+    (preclean)
     (print "removing directory " br)
-    (sh/rm br))
+    (sh/rm br)
+    (postclean))
   (defn run-task [task]
-    (prebuild)
     (build-rules/build-run e task (dyn :workers)))
   (defglobal 'install install)
   (defglobal 'build build)
@@ -366,7 +398,7 @@
       (def auto-shebang (and is-janet (not (string/has-prefix? "#!" first-line))))
       (def dynamic-syspath (= hardcode-syspath :dynamic))
       (def second-line (string/format "(put root-env :original-syspath (os/realpath (dyn *syspath*))) # auto generated\n"))
-      (def third-line  (string/format "(put root-env :syspath %v) # auto generated\n" (dyn *syspath*)))
+      (def third-line (string/format "(put root-env :syspath %v) # auto generated\n" (dyn *syspath*)))
       (def fourth-line (string/format "(put root-env :install-time-syspath %v) # auto generated\n" (dyn *syspath*)))
       (def last-line "\n(put root-env :syspath (get root-env :original-syspath)) # auto generated\n")
       (def rest (:read f :all))
@@ -375,8 +407,7 @@
               (if (or dynamic-syspath hardcode-syspath) second-line)
               (if hardcode-syspath third-line)
               (if hardcode-syspath fourth-line)
-              rest
-              (if dynamic-syspath last-line))))
+              rest)))
   (install-buffer contents dest 8r755 (mkbin))
   (when (is-win-or-mingw)
     (def absdest (path/join (dyn *syspath*) dest))
