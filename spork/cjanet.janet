@@ -11,27 +11,45 @@
 ### subset of valid C 99.
 ###
 
+(import ./cc)
+(import ./pm-config)
+
 (def- mangle-peg
   (peg/compile
     ~{:valid (range "az" "AZ" "__")
+      :one (+ '"->" (/ "-" "_") ':valid '"." '":" (/ '1 ,|(string "_X" ($ 0))))
+      :main (% (* (? "@") :one (any (+ ':d :one))))}))
+
+(def- mangle-strict-peg
+  (peg/compile
+    ~{:valid (range "az" "AZ" "__")
       :one (+ (/ "-" "_") ':valid (/ '1 ,|(string "_X" ($ 0))))
-      :main (% (* :one (any (+ ':d :one))))}))
+      :main (% (* (? "@") :one (any (+ ':d :one))))}))
 
 (def- bops
   {'+ '+ '- '- '* '* '/ '/ '% '% '< '<
-   '> '> '<= '<= '>= '>= '== '== '!= '!=
+   '> '> '<= '<= '>= '>= '== '== '= '== '!= '!=
    'not= "!="
    '>> ">>" '<< "<<" '&& "&&" '^ "^"
    'and "&&" 'or "||" 'band "&" 'bor "|" 'bxor "^" 'set "="
    'blshift "<<" 'brshift ">>"})
 
-(def- uops {'bnot "~" 'not "!" 'neg "-" '! "!" '++ "++" '-- "--"})
+(def- uops {'bnot "~" 'not "!" 'neg "-" '- "-" '! "!" '++ "++" '-- "--"})
 
 (defn mangle
-  "Convert any sequence of bytes to a valid C identifier in a way that is unlikely to collide.
-  `print-ir` will not mangle symbols for you."
+  ``
+  Convert any sequence of bytes to a valid C identifier in a way that is unlikely to collide. The period character
+  is left unchanged even though it is not a valid identifier to allow for easy access into structs.
+  ``
   [token]
   (first (peg/match mangle-peg token)))
+
+(defn mangle-strict
+  ``
+  Same as `mangle` but only emit proper C identifiers (no ., :,  or -> allowed).
+  ``
+  [token]
+  (first (peg/match mangle-strict-peg token)))
 
 (def- type-split-peg
   (peg/compile '(* (? (* '(to ":") ":")) '(any 1))))
@@ -39,9 +57,10 @@
 (defn type-split
   "Extract name and type from a variable. Allow typing variables as both
   (name type) or name:type as a shorthand. If no type is found, default to dflt-type. dflt-type
-  itself defaults to 'auto"
+  itself defaults to '__auto_type"
   [x &opt dflt-type]
-  (default dflt-type 'auto)
+  (default dflt-type '__auto_type)
+  # This needs to be defined based on c compiler - "auto" for msvc and c23+, and __auto_type for clang and GCC on older standards
   (case (type x)
     :tuple x
     :symbol
@@ -62,6 +81,44 @@
     (let [[v t d] (assert (peg/match type-split-dflt-peg x))]
       [(symbol v) (symbol t) (parse d)])
     (errorf "expected symbol (symbol type dflt) tuple, got %j" x)))
+
+# Macros
+# We need to be judicious with macros as they can obscure real C functions. In practice we can get
+# around this with mangling magic - add a leading "@" to the symbol and it will not match a macro name
+
+(def- extra-macros @{})
+
+(defn- expand-macro
+  "Expand macros given a specific tag"
+  [macro-tag form]
+  (unless (tuple? form) (break form))
+  (def head (first form))
+  (unless (symbol? head) (break form))
+  (def entry (get extra-macros head (dyn head)))
+  (unless (get entry macro-tag) (break form))
+  (def expand1 ((get entry :value) ;(drop 1 form)))
+  (expand-macro macro-tag expand1))
+
+(defn- register-macro
+  [macro-tag name value]
+  (put extra-macros (symbol name) {macro-tag true :value value}))
+
+(register-macro :cjanet-block-macro 'when when)
+(register-macro :cjanet-block-macro 'if-not if-not)
+(register-macro :cjanet-block-macro 'unless unless)
+(register-macro :cjanet-block-macro 'let let)
+(register-macro :cjanet-statement-macro '+= |~(set ,$0 (+ ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '-= |~(set ,$0 (- ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '*= |~(set ,$0 (* ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '/= |~(set ,$0 (/ ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '^= |~(set ,$0 (bxor ,$0 ,$1)))
+(register-macro :cjanet-statement-macro 'bxor= |~(set ,$0 (bxor ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '&= |~(set ,$0 (band ,$0 ,$1)))
+(register-macro :cjanet-statement-macro 'band= |~(set ,$0 (band ,$0 ,$1)))
+(register-macro :cjanet-statement-macro 'bor= |~(set ,$0 (bor ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '<<= |~(set ,$0 (<< ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '>>= |~(set ,$0 (>> ,$0 ,$1)))
+(register-macro :cjanet-statement-macro '%= |~(set ,$0 (% ,$0 ,$1)))
 
 ###
 ### Emitting C
@@ -92,19 +149,19 @@
 (defn- emit-struct-union-def
   [which name args defname]
   (when (or (nil? args) (empty? args))
-    (prin which " " name)
-    (if defname (prin " " defname))
+    (prin which " " (mangle name))
+    (if defname (prin " " (mangle defname)))
     (break))
   (assert (even? (length args)) (string/format "expected even number of arguments, got %j" args))
   (prin which " ")
-  (if name (prin name " "))
+  (if name (prin (mangle name) " "))
   (emit-block-start)
   (each [field ftype] (partition 2 args)
     (emit-indent)
     (emit-type ftype field)
     (print ";"))
   (emit-block-end)
-  (if defname (prin " " defname)))
+  (if defname (prin " " (mangle defname))))
 
 (defn- emit-struct-def
   [name args defname]
@@ -117,7 +174,7 @@
 (defn- emit-enum-def
   [name args defname]
   (prin "enum ")
-  (if name (prin name " "))
+  (if name (prin (mangle name) " "))
   (emit-block-start)
   (each x args
     (emit-indent)
@@ -128,13 +185,13 @@
         (print ","))
       (print x ",")))
   (emit-block-end)
-  (if defname (prin " " defname)))
+  (if defname (prin " " (mangle defname))))
 
 (defn- emit-fn-pointer-type
   [ret-type args defname]
   (prin "(")
   (emit-type ret-type)
-  (prin ")(*" defname ")(")
+  (prin ")(*" (mangle defname) ")(")
   (var is-first true)
   (each x args
     (unless is-first (prin ", "))
@@ -148,25 +205,25 @@
   [x alias]
   (emit-type x)
   (prin " *")
-  (if alias (prin alias)))
+  (if alias (prin (mangle alias))))
 
 (defn- emit-ptr-ptr-type
   [x alias]
   (emit-type x)
   (prin " **")
-  (if alias (prin alias)))
+  (if alias (prin (mangle alias))))
 
 (defn- emit-const-type
   [x alias]
   (prin "const ")
   (emit-type x)
-  (if alias (prin " " alias)))
+  (if alias (prin " " (mangle alias))))
 
 (defn- emit-array-type
   [x n alias]
   (if-not alias (prin "("))
   (emit-type x)
-  (if alias (prin " " alias))
+  (if alias (prin " " (mangle alias)))
   (prin "[")
   (when n
     (emit-expression n true))
@@ -176,7 +233,7 @@
 (varfn emit-type
   [definition &opt alias]
   (match definition
-    (d (bytes? d)) (do (prin d) (if alias (prin " " alias)))
+    (d (bytes? d)) (do (prin (mangle d)) (if alias (prin " " (mangle alias))))
     (t (tuple? t))
     (match t
       ['struct & body] (emit-struct-def nil body alias)
@@ -188,6 +245,7 @@
       ['fn n & body] (emit-fn-pointer-type n body alias)
       ['ptr val] (emit-ptr-type val alias)
       ['* val] (emit-ptr-type val alias)
+      ['quote val] (emit-ptr-type val alias) # shorthand
       ['ptrptr val] (emit-ptr-ptr-type val alias)
       ['** val] (emit-ptr-ptr-type (definition 1) alias)
       ['const t] (emit-const-type t alias)
@@ -264,7 +322,9 @@
 
 (defn- emit-cast
   [ctype expr]
-  (prin "(" ctype ")")
+  (prin "(")
+  (emit-type ctype)
+  (prin ")")
   (emit-expression expr))
 
 (defn- emit-struct-ctor
@@ -292,8 +352,11 @@
 
 (varfn emit-expression
   [form &opt noparen]
+  #(tracev form)
+  (def form (expand-macro :cjanet-expression-macro form))
+  #(tracev form)
   (match form
-    (f (or (symbol? f) (keyword? f))) (prin f)
+    (f (or (symbol? f) (keyword? f))) (prin (mangle f))
     (n (number? n)) (prinf "%.17g" n)
     (s (string? s)) (prinf "%v" s) # todo - better match escape codes
     (a (array? a)) (do
@@ -309,15 +372,18 @@
     (do
       (unless noparen (prin "("))
       (match t
-        [(bs (bops bs)) & rest] (emit-binop (bops bs) ;rest)
+        [(bs (bops bs)) arg1 arg2 & rest] (emit-binop (bops bs) arg1 arg2 ;rest)
         [(bs (uops bs)) & rest] (emit-unop (uops bs) ;rest)
         ['literal l] (prin (string l))
-        ['quote q] (prin (string q))
-        ['aref v i] (emit-aindex v i)
+        ['aref v i & more]
+          (do (assert (empty? more) "aref expects two arguments") (emit-aindex v i))
         ['call & args] (emit-funcall args)
         ['set v i] (emit-set v i)
         ['deref v] (emit-deref v)
         ['addr v] (emit-address v)
+        ['& v] (emit-address v)
+        ['splice v] (emit-address v) # hack
+        ['quote q] (emit-deref q) # quote looks a bit like "*"
         ['cast t v] (emit-cast t v)
         ['struct & vals] (emit-struct-ctor vals)
         ['array & vals] (emit-array-ctor vals)
@@ -326,6 +392,8 @@
         ['. v f] (emit-indexer "." v f)
         (emit-funcall t))
       (unless noparen (prin ")")))
+    (b (boolean? b)) (prinf "%j" form)
+    (n (nil? n)) (prin "NULL")
     ie (errorf "invalid expression %v" ie)))
 
 # Statements
@@ -340,19 +408,20 @@
 
 (varfn emit-statement
   [form]
+  (def form (expand-macro :cjanet-statement-macro form))
   (match form
     ['def & args] (emit-declaration ;args)
+    ['var & args] (emit-declaration ;args)
+    nil (prin ";")
     (emit-expression form true)))
 
 # Blocks
 
 (defn emit-blocks
   "Emit a number of statements in a bracketed block"
-  [statements]
-  (when (one? (length statements))
-    (emit-block (get statements 0))
-    (break))
-  (emit-indent)
+  [statements &opt no-indent]
+  (default statements [])
+  (unless no-indent (emit-indent))
   (emit-block-start)
   (each s statements
     (emit-block s true))
@@ -363,8 +432,9 @@
   [args]
   (assert (>= (length args) 2) "expected at least 2 arguments to if")
   (var is-first true)
-  (each [condition branch] (partition 2 args)
-    (if (= nil branch)
+  (each chunk (partition 2 args)
+    (def [condition branch] chunk)
+    (if (= 1 (length chunk))
       (do
         (prin " else ")
         (emit-block condition))
@@ -384,7 +454,7 @@
   (prin "while (")
   (emit-expression condition true)
   (prin ") ")
-  (emit-blocks [stm ;body])
+  (emit-blocks [stm ;body] true)
   (print))
 
 (defn- case-literal? [x] (or (symbol? x) (and (number? x) (= x (math/floor x)))))
@@ -418,14 +488,13 @@
   [init cond step body]
   (emit-indent)
   (prin "for (")
-  (emit-expression init true)
+  (emit-statement init)
   (prin "; ")
   (emit-expression cond true)
   (prin "; ")
   (emit-expression step true)
   (prin ") ")
-  (emit-blocks body)
-  (print))
+  (emit-blocks body true))
 
 (defn- emit-return
   [v]
@@ -435,22 +504,23 @@
   (print ";"))
 
 (varfn emit-block
-  [form &opt nobracket]
+  [form &opt nobracket noindent]
+  (def form (expand-macro :cjanet-block-macro form))
   (unless nobracket
     (emit-block-start))
   (match form
     ['do & body] (emit-blocks body)
     ['while cond stm & body] (emit-while cond stm body)
     ['for [init cond step] & body] (emit-for init cond step body)
-    ['switch cond & body] (emit-switch cond body)
     ['if & body] (emit-cond body)
+    ['switch cond & body] (emit-switch cond body)
     ['cond & body] (emit-cond body)
     ['return val] (emit-return val)
-    ['break] (do (emit-indent) (print "break;"))
-    ['continue] (do (emit-indent) (print "continue;"))
-    ['label lab] (print "label " lab ":")
-    ['goto lab] (do (emit-indent) (print "goto " (form 1)))
-    stm (do (emit-indent) (emit-statement stm) (print ";")))
+    ['break] (do (unless noindent (emit-indent)) (print "break;"))
+    ['continue] (do (unless noindent (emit-indent)) (print "continue;"))
+    ['label lab] (print (mangle-strict lab) ":")
+    ['goto lab] (do (unless noindent (emit-indent)) (print "goto " (mangle-strict (form 1))))
+    stm (do (unless noindent (emit-indent)) (emit-statement stm) (print ";")))
   (unless nobracket (emit-block-end)))
 
 # Top level forms
@@ -466,7 +536,7 @@
   (emit-comment docstring)
   (emit-storage-classes classes)
   (emit-type rtype)
-  (prin " " name "(")
+  (prin " " (mangle name) "(")
   (var is-first true)
   (each arg arglist
     (unless is-first (prin ", "))
@@ -524,7 +594,11 @@
 
 (defn emit-include
   [path]
-  (emit-preprocess :include path))
+  # Add quoting for you
+  (def path1 (if (or (string/has-prefix? "<" path) (string/has-prefix? `"` path))
+               path
+               (string `"` path `"`)))
+  (emit-preprocess :include path1))
 
 ###
 ### Top-Level code emitting macros (wrappers around emit-* functions). The macro
@@ -550,6 +624,59 @@
 (defdyn *cfun-list* "Array of C Functions defined in the current scope")
 (defdyn *cdef-list* "Array of C Constants defined in the current scope")
 
+(def- bindgen-table
+  ```
+  Store symbols needed to extract or return types for cfunctions.
+  Each entry is [alias ctype wrapper-fn getter-fn opt-fn]
+  All of the function columns can be nil if that operation is not
+  supported for that type when creating bindings.
+  ```
+  [[:value 'Janet nil 'aref]
+   [:any 'Janet nil 'aref]
+   [:bool 'int 'janet-wrap-boolean 'janet-getboolean 'janet-optboolean]
+   [:nat 'int 'janet-wrap-number 'janet-getnat 'janet-optnat]
+   [:int 'int 'janet-wrap-number 'janet-getinteger 'janet-optinteger]
+   [:number 'double 'janet-wrap-number 'janet-getnumber 'janet-optnumber]
+   [:double 'double 'janet-wrap-number 'janet-getnumber 'janet-optnumber]
+   [:float 'float 'janet-wrap-number 'janet-getnumber 'janet-optnumber]
+   [:int32 'int32_t 'janet-wrap-number 'janet-getinteger 'janet-optinteger]
+   [:int64 'int64_t 'janet-wrap-s64 'janet-getinteger64 'janet-optinteger64]
+   [:uint32 'uint32_t 'janet-wrap-number 'janet-getuinteger 'janet-optuinteger]
+   [:uint64 'uint64_t 'janet-wrap-u64 'janet-getuinteger64 'janet-optuinteger64]
+   [:size 'size_t 'janet-wrap-u64 'janet-getsize 'janet-optsize]
+   [:fiber '(* JanetFiber) 'janet-wrap-fiber 'janet-getfiber 'janet-optfiber]
+   [:array '(* JanetArray) 'janet-wrap-array 'janet-getarray 'janet-optarray]
+   [:tuple 'JanetTuple 'janet-wrap-tuple 'janet-gettuple 'janet-opttuple]
+   [:table '(* JanetTable) 'janet-wrap-table 'janet-gettable 'janet-opttable]
+   [:struct 'JanetStruct 'janet-wrap-struct 'janet-getstruct 'janet-optstruct]
+   [:string 'JanetString 'janet-wrap-string 'janet-getstring nil]
+   [:cstring '(const (* char)) 'janet_cstringv 'janet-getcstring 'janet-optcstring]
+   [:symbol 'JanetSymbol 'janet-wrap-symbol 'janet-getsymbol nil]
+   [:keyword 'JanetKeyword 'janet-wrap-keyword 'janet-getkeyword nil]
+   [:buffer '(* JanetBuffer) 'janet-wrap-buffer 'janet-getbuffer 'janet-optbuffer]
+   [:cfunction 'JanetCFunction 'janet-wrap-cfunction 'janet-getcfunction 'janet-optcfunction]
+   [:function '(* JanetFunction) 'janet-wrap-function 'janet-getfunction nil]
+   [:abstract '(* void) 'janet-wrap-abstract nil nil]
+   [:pointer '(* void) 'janet-wrap-pointer 'janet-getpointer 'janet-optpointer]
+   [:bytes 'JanetByteView nil 'janet-getbytes nil]
+   [:indexed 'JanetView nil 'janet-getindexed nil]
+   [:dictionary 'JanetDictView nil 'janet-getdictionary nil]])
+
+# Create convenient to use tables
+(def- alias-to-ctype @{})
+(def- alias-or-ctype-to-wrap @{})
+(def- alias-or-ctype-to-get @{})
+(def- alias-or-ctype-to-opt @{})
+(each [alias ctype wrapfn getfn optfn] bindgen-table
+  (def alias (symbol alias))
+  (put alias-to-ctype alias ctype)
+  (put alias-or-ctype-to-wrap ctype wrapfn)
+  (put alias-or-ctype-to-wrap alias wrapfn)
+  (put alias-or-ctype-to-get ctype getfn)
+  (put alias-or-ctype-to-get alias getfn)
+  (put alias-or-ctype-to-opt ctype optfn)
+  (put alias-or-ctype-to-opt alias optfn))
+
 (defn- wrap-v
   "Generate code to wrap any Janet (constant) literal"
   [x]
@@ -565,108 +692,23 @@
 (defn- return-wrap
   "Generate code to convert return types to a janet value"
   [T code]
-  (case (keyword T)
-    :value code
-    :any code
-    :Janet code
-    :number ~(janet_wrap_number ,code)
-    :double ~(janet_wrap_number ,code)
-    :float ~(janet_wrap_number ,code)
-    :int ~(janet_wrap_number ,code)
-    :nat ~(janet_wrap_number ,code)
-    :int32 ~(janet_wrap_number ,code)
-    :int64 ~(janet_wrap_s64 ,code)
-    :uint64 ~(janet_wrap_u64 ,code)
-    :size ~(janet_wrap_u64 ,code)
-    :fiber ~(janet_wrap_fiber ,code)
-    :array ~(janet_wrap_array ,code)
-    :tuple ~(janet_wrap_tuple ,code)
-    :table ~(janet_wrap_table ,code)
-    :struct ~(janet_wrap_struct ,code)
-    :string ~(janet_wrap_string ,code)
-    :cstring ~(janet_cstringv ,code)
-    :symbol ~(janet_wrap_symbol ,code)
-    :keyword ~(janet_wrap_keyword ,code)
-    :buffer ~(janet_wrap_buffer ,code)
-    :cfunction ~(janet_wrap_cfunction ,code)
-    :function ~(janet_wrap_function ,code)
-    :bool ~(janet_wrap_boolean ,code)
-    :pointer ~(janet_wrap_pointer ,code)
-    :asbtract ~(janet_wrap_abstract ,code)
+  (def wrapfn (get alias-or-ctype-to-wrap T))
+  (if wrapfn
+    ~(,wrapfn ,code)
     (errorf "cannot convert type %v to a Janet return value" T)))
-
-
-(def- type-alias-to-ctype
-  {:value 'Janet
-   :any 'Janet
-   :Janet 'Janet
-   :number 'double
-   :double 'double
-   :float 'float
-   :int 'int
-   :nat 'int32_t
-   :int32 'int32_t
-   :int64 'int64_t
-   :uint64 'uint64_t
-   :size 'size_t
-   :fiber '(* JanetFiber)
-   :array '(* JanetArray)
-   :tuple 'JanetTuple
-   :table '(* JanetTable)
-   :struct 'JanetStruct
-   :string 'JanetString
-   :cstring '(const (* char))
-   :symbol 'JanetSymbol
-   :keyword 'JanetKeyword
-   :buffer '(* JanetBuffer)
-   :cfunction 'JanetCFunction
-   :function '(* JanetFunction)
-   :bool 'int
-   :pointer '(* void)
-   :bytes 'JanetByteView
-   :indexed 'JanetView
-   :dictionary 'JanetDictView})
 
 (defn- janet-get*
   "Get cjanet fragment to extract a given type T into an argument v. The
   parameter is expcted to be in the Janet * argv at index n, no bounds checking needed."
   [binding argv n param-names cparams]
   (def [v T] (type-split binding))
+  (def ctype (get alias-to-ctype T T))
+  (def getfn (get alias-or-ctype-to-get T))
   (array/push param-names v)
-  (array/push cparams [v (get type-alias-to-ctype (keyword T) '(* void))])
-  (case (keyword T)
-    :value ~(def (,v Janet) (aref ,argv ,n))
-    :any ~(def (,v Janet) (aref ,argv ,n))
-    :Janet ~(def (,v Janet) (aref ,argv ,n))
-    :number ~(def (,v double) (janet_getnumber ,argv ,n))
-    :double ~(def (,v double) (janet_getnumber ,argv ,n))
-    :float ~(def (,v float) (janet_getnumber ,argv ,n))
-    :int ~(def (,v int) (janet_getinteger ,argv ,n))
-    :nat ~(def (,v int32_t) (janet_getnat ,argv ,n))
-    :int32 ~(def (,v int32_t) (janet_getinteger ,argv ,n))
-    :int64 ~(def (,v int64_t) (janet_getinteger64 ,argv ,n))
-    :uint64 ~(def (,v uint64_t) (janet_getuinteger64 ,argv ,n))
-    :size ~(def (,v size_t) (janet_getsize ,argv ,n))
-    :fiber ~(def (,v (* JanetFiber)) (janet_getfiber ,argv ,n))
-    :array ~(def (,v (* JanetArray)) (janet_getarray ,argv ,n))
-    :tuple ~(def (,v JanetTuple) (janet_gettuple ,argv ,n))
-    :table ~(def (,v (* JanetTable)) (janet_gettable ,argv ,n))
-    :struct ~(def (,v JanetStruct) (janet_getstruct ,argv ,n))
-    :string ~(def (,v JanetString) (janet_getstring ,argv ,n))
-    :cstring ~(def (,v (const (* char))) (janet_getcstring ,argv ,n))
-    :symbol ~(def (,v JanetSymbol) (janet_getsymbol ,argv ,n))
-    :keyword ~(def (,v JanetKeyword) (janet_getkeyword ,argv ,n))
-    :buffer ~(def (,v (* JanetBuffer)) (janet_getbuffer ,argv ,n))
-    :cfunction ~(def (,v JanetCFunction) (janet_getcfunction ,argv ,n))
-    :function ~(def (,v (* JanetFunction)) (janet_getfunction ,argv ,n))
-    :bool ~(def (,v int) (janet_getboolean ,argv ,n))
-    :pointer ~(def (,v (* void)) (janet_getpointer ,argv ,n))
-    :bytes ~(def (,v JanetByteView) (janet_getbytes ,argv ,n))
-    :indexed ~(def (,v JanetView) (janet_getindexed ,argv ,n))
-    :dictionary ~(def (,v JanetDictView) (janet_getdictionary ,argv ,n))
-    # default - must be abstract
-    (do
-      ~(def (,v (* void)) (janet_getabstract ,argv ,n ,T)))))
+  (array/push cparams [v ctype])
+  (if getfn
+    ~(def (,v ,ctype) (,getfn ,argv ,n))
+    ~(def (,v (* void)) (janet_getabstract ,argv ,n ,T))))
 
 (defn- janet-opt*
   "Get cjanet fragment to extract optional parameters. Similar to non-optional parameters
@@ -674,29 +716,14 @@
   all psuedo-types are supported as optional."
   [binding argv argc n param-names cparams]
   (def [v T dflt] (type-split-dflt binding))
+  (def ctype (get alias-to-ctype T T))
+  (def optfn (get alias-or-ctype-to-opt T))
   (array/push param-names v)
-  (array/push cparams [v (get type-alias-to-ctype (keyword T) '(* void))])
-  (case (keyword T)
-    :value ~(def (,v Janet) (? (> argc ,n) (aref ,argv ,n) ,(wrap-v dflt)))
-    :any ~(def (,v Janet) (? (> argc ,n) (aref ,argv ,n) ,(wrap-v dflt)))
-    :Janet ~(def (,v Janet) (? (> argc ,n) (aref ,argv ,n) ,(wrap-v dflt)))
-    :number ~(def (,v double) (janet_optnumber ,argv ,argc ,n ,dflt))
-    :double ~(def (,v double) (janet_optnumber ,argv ,argc ,n ,dflt))
-    :float ~(def (,v float) (janet_optnumber ,argv ,argc ,n ,dflt))
-    :int ~(def (,v int) (janet_optinteger ,argv ,argc ,n ,dflt))
-    :nat ~(def (,v int32_t) (janet_optnat ,argv ,argc ,n ,dflt))
-    :int32 ~(def (,v int32_t) (janet_optinteger ,argv ,argc ,n ,dflt))
-    :int64 ~(def (,v int64_t) (janet_optinteger64 ,argv ,n))
-    :uint64 ~(def (,v uint64_t) (janet_getuinteger64 ,argv ,argc ,n ,dflt))
-    :size ~(def (,v size_t) (janet_optsize ,argv ,argc ,n ,dflt))
-    :array ~(def (,v (* JanetArray)) (janet_optarray ,argv ,argc ,n ,dflt))
-    :table ~(def (,v (* JanetTable)) (janet_opttable ,argv ,argc ,n ,dflt))
-    :cstring ~(def (,v (const (* char))) (janet_optcstring ,argv ,argc ,n ,dflt))
-    :buffer ~(def (,v (* JanetBuffer)) (janet_optbuffer ,argv ,argc ,n ,dflt))
-    :cfunction ~(def (,v JanetCFunction) (janet_optcfunction ,argv ,argc ,n ,dflt))
-    :bool ~(def (,v int) (janet_optboolean ,argv ,argc ,n ,dflt))
-    :pointer ~(def (,v (* void)) (janet_optpointer ,argv ,argc ,n ,dflt))
-    (do
+  (array/push cparams [v ctype])
+  (if (in '{value 1 any 1 Janet 1} T)
+    ~(def (,v Janet) (? (> argc ,n) (aref ,argv ,n) ,(wrap-v dflt)))
+    (if optfn
+      ~(def (,v ,ctype) (,optfn ,argv ,argc ,n ,dflt))
       ~(def (,v (* void)) (janet_optabstract ,argv ,argc ,n ,T ,dflt)))))
 
 (defn emit-cfunction
@@ -749,13 +776,14 @@
   (def max-arity (if (or amp-index named-index keys-index) -1 pcount))
   (buffer/push signature ")")
   # Generate function for use in C
-  (emit-function-impl docstring classes mangledname cparams (get type-alias-to-ctype (keyword ret-type))
-                      (eval (qq-wrap body)))
+  (emit-function-impl docstring classes mangledname cparams (get alias-to-ctype ret-type ret-type)
+                      body)
+                      # (eval (qq-wrap body)))
   # Generate wrapper for use in Janet
   (def cfun_name (mangle (string "_generated_cfunction_" mangledname)))
   (print "\nJANET_FN(" cfun_name ",")
-  (print "        " (string/format "%j" (string signature)) ", ")
-  (print "        " (string/format "%j" (string docstring)) ")")
+  (print "         " (string/format "%j" (string signature)) ", ")
+  (print "         " (string/format "%j" (string docstring)) ")")
   (block
     ,(if (= min-arity max-arity)
        ~(janet_fixarity argc ,min-arity)
@@ -773,7 +801,8 @@
   or janet_fixarity).
   ```
   [name & more]
-  (emit-cfunction name ;more))
+  ~(,emit-cfunction ,;(qq-wrap [name ;more])))
+  #(emit-cfunction name ;more))
 
 (defn emit-cdef
   ```
@@ -795,7 +824,7 @@
   It takes care of the docstring.
   ```
   [name & more]
-  (emit-cdef name ;more))
+  ~(,emit-cdef ,;(qq-wrap [name ;more])))
 
 (defn emit-module-entry
   "Call this at the end of a cjanet module to add a module entry function."
@@ -812,3 +841,91 @@
   "Call this at the end of a cjanet module to add a module entry function."
   [name]
   (emit-module-entry name))
+
+###
+### "JIT" functionality for use in repl and to reduce boilerplate
+###
+
+(defdyn *jit-context* "A context value for storing the current state of compilation, including buffers, flags, and tool paths.")
+
+(defn begin-jit
+  ```
+  Begin C Janet JIT context. Optionally pass in options to configure compilation. The `options` argument
+  will be passed to the `spork/cc` module to compile generated C code. Generated intermediates will be created
+  in the _cjanet/ directory.
+  ```
+  [&keys options]
+  (def compilation-unit @"#include <janet.h>\n")
+  (def prevout (dyn *out*))
+  (def cont
+    {:buffer compilation-unit
+     :build-dir "_cjanet"
+     :opts options
+     :old-out prevout
+     :module-name (get options :module-name (string "cjanet_" (os/getpid)))})
+  (setdyn *jit-context* cont)
+  (os/mkdir "_cjanet")
+  (setdyn *out* compilation-unit)
+  cont)
+
+(defn end-jit
+  ```
+  End current compilation context, compile all buffered code, and then by default load it into the current process.
+  The `no-load` argument controls whether or not the compiled code is loaded. If `no-load` is truthy, then
+  this function will return the path to the compiled shared object and skip loading.
+  If `cache` is truthy, this function will use a previously compiled shared object or DLL if it exists and the source code matches.
+  ```
+  [&named no-load cache]
+
+  # 0. Unpack context
+  (def ccontext (assert (dyn *jit-context*)))
+  (def module-name (assert (get ccontext :module-name)))
+  (def builddir (assert (get ccontext :build-dir)))
+  (def opts (get ccontext :opts {}))
+  (def buf (assert (get ccontext :buffer)))
+  (def prevout (get ccontext :old-out))
+  (def toolchain (pm-config/detect-toolchain (curenv)))
+
+  # 1. Create module entry
+  (emit-module-entry module-name)
+
+  # 2. Reset old context
+  (setdyn *jit-context* nil)
+  (setdyn *out* prevout)
+
+  # 3. Emit C source code
+  (os/mkdir builddir)
+  (def name (string builddir "/" module-name))
+  (def c-source (string name ".c"))
+  (if cache
+    (do
+      (def [has-old old-source] (protect (slurp c-source)))
+      (unless (deep= old-source buf)
+        (spit c-source buf)))
+    (spit c-source buf))
+  (when (get opts :eprint-source) (eprint buf)) # debug
+  (buffer/clear buf)
+  (buffer/trim buf) # save mem
+
+  # 4. Compile to shared object
+  (var so (string name ".so"))
+  (with-dyns []
+    (def env (curenv))
+    (eachp [k v] opts (setdyn k v))
+    # These cannot be overriden
+    (setdyn cc/*visit* cc/visit-execute-if-stale)
+    (setdyn cc/*build-dir* builddir)
+    (when-let [pc (get opts :pkg-config)]
+      (cc/pkg-config ;pc))
+    (if (= :msvc toolchain)
+      (do
+        (set so (string name ".dll"))
+        (put env cc/*lflags* @[;(get env cc/*lflags* @[]) "/NOIMPLIB"])
+        (cc/msvc-compile-and-link-shared so c-source))
+      (do
+        (cc/compile-and-link-shared so c-source))))
+
+  # 5. Import shared object
+  (if no-load
+    so
+    (native so (curenv))))

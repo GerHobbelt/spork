@@ -45,7 +45,7 @@
 (defdyn *visit* "Optional callback to process each CLI command and its inputs and outputs")
 (defdyn *use-rpath* "Optional setting to enable using `(dyn *syspath*)` as the runtime path to load for Shared Objects. Defaults to true")
 (defdyn *use-rdynamic*
-  ``Optional setting to enable using `-rdynamic` or `-Wl,-export_dynamic` when linking executables.
+  ``Optional setting to enable using `-rdynamic` or `-Wl,-export_dynamic` when linking executables
   This is the preferred way on POSIX systems to let an executable load native modules dynamically at runtime.
   Defaults to true``)
 (defdyn *pkg-config-flags* "Extra flags to pass to pkg-config")
@@ -109,6 +109,7 @@
 ### Universal helpers for all toolchains
 ###
 
+(defmacro- notail [x] ~(do (def ,(gensym) ,x)))
 (defn- cflags [] (dyn *cflags* []))
 (defn- c++flags [] (dyn *c++flags* []))
 (defn- lflags [] (dyn *lflags* []))
@@ -151,6 +152,7 @@
 (defn- exec
   "Call the (dyn *visit*) function on commands"
   [cmd inputs outputs message]
+  #(tracev cmd) -> how to find empty strings being passed as arguments
   ((dyn *visit* default-exec) cmd inputs outputs message) cmd)
 
 (defn- getsetdyn
@@ -171,6 +173,8 @@
     # object files
     (string/has-suffix? ".o" path) :o
     (string/has-suffix? ".obj" path) :o
+    # janet source - (preprocess)
+    (string/has-suffix? ".janet" path) :janet
     # else
     (errorf "unknown source file type for %v" path)))
 
@@ -221,17 +225,19 @@
   (def dl (if (= (target-os) :macos) ["-undefined" "dynamic_lookup"] []))
   (def sg (if (smart-libs) ["-Wl,--start-group"] []))
   (def eg (if (smart-libs) ["-Wl,--end-group"] []))
-  (def bs (if (not= (target-os) :macos) ["-Wl,-Bstatic"] []))
-  (def bd (if (not= (target-os) :macos) ["-Wl,-Bdynamic"] []))
+  (def slibs (static-libs))
+  (def dlibs (dynamic-libs))
+  (def bs (if (and (next slibs) (not= (target-os) :macos)) ["-Wl,-Bstatic"] []))
+  (def bd (if (and (or (next slibs) (next dlibs)) (not= (target-os) :macos)) ["-Wl,-Bdynamic"] []))
   [;sg
    ;(lflags)
    ;(if static ["-static"] [])
    ;dl
    ;(default-libs)
    ;bs
-   ;(static-libs)
+   ;slibs
    ;bd
-   ;(dynamic-libs)
+   ;dlibs
    ;(if static bs []) # put back to static linking so the -static flag works.
    ;eg
    ;(rpath)])
@@ -255,43 +261,58 @@
 (defn compile-c
   "Compile a C source file to an object file. Return the command arguments."
   [from to]
-  (exec [(cc) (ccstd) ;(opt) ;(cflags) ;(extra-paths) "-fPIC" ;(defines) "-c" from "-o" to "-pthread"]
-        [from] [to] (string "compiling " from "...")))
+  (notail
+    (exec [(cc) (ccstd) ;(opt) ;(cflags) ;(extra-paths) "-fPIC" ;(defines) "-c" from "-o" to "-pthread"]
+          [from] [to] (string "compiling " from "..."))))
 
 (defn compile-c++
   "Compile a C++ source file to an object file. Return the command arguments."
   [from to]
-  (exec [(c++) (c++std) ;(opt) ;(c++flags) ;(extra-paths) "-fPIC" ;(defines) "-c" from "-o" to "-pthread"]
-        [from] [to] (string "compiling " from "...")))
+  (notail
+    (exec [(c++) (c++std) ;(opt) ;(c++flags) ;(extra-paths) "-fPIC" ;(defines) "-c" from "-o" to "-pthread"]
+          [from] [to] (string "compiling " from "..."))))
 
 (defn link-shared-c
   "Link a C program to make a shared library. Return the command arguments."
   [objects to]
-  (exec [(cc) (ccstd) ;(opt) ;(cflags) ;(extra-link-paths) "-o" to ;objects "-pthread" ;(libs false) ;(dynamic-libs) "-shared"]
-        objects [to] (string "linking " to "...")))
+  (notail
+    (exec [(cc) (ccstd) ;(opt) ;(cflags) ;(extra-link-paths) "-o" to ;objects "-pthread" ;(libs false) ;(dynamic-libs) "-shared"]
+          objects [to] (string "linking " to "..."))))
 
 (defn link-shared-c++
   "Link a C++ program to make a shared library. Return the command arguments."
   [objects to]
-  (exec [(c++) (c++std) ;(opt) ;(c++flags) ;(extra-link-paths) "-o" to ;objects "-pthread" ;(libs false) ;(dynamic-libs) "-shared"]
-        objects [to] (string "linking " to "...")))
+  (notail
+    (exec [(c++) (c++std) ;(opt) ;(c++flags) ;(extra-link-paths) "-o" to ;objects "-pthread" ;(libs false) ;(dynamic-libs) "-shared"]
+          objects [to] (string "linking " to "..."))))
 
 (defn link-executable-c
   "Link a C program to make an executable. Return the command arguments."
   [objects to &opt make-static]
-  (exec [(cc) (ccstd) ;(opt) ;(cflags) ;(extra-link-paths) "-o" to ;objects ;(rdynamic) "-pthread" ;(libs make-static)]
-        objects [to] (string "linking " to "...")))
+  (notail
+    (exec [(cc) (ccstd) ;(opt) ;(cflags) ;(extra-link-paths) "-o" to ;objects ;(rdynamic) "-pthread" ;(libs make-static)]
+          objects [to] (string "linking " to "..."))))
 
 (defn link-executable-c++
   "Link a C++ program to make an executable. Return the command arguments."
   [objects to &opt make-static]
-  (exec [(c++) (c++std) ;(opt) ;(c++flags) ;(extra-link-paths) "-o" to ;objects ;(rdynamic) "-pthread" ;(libs make-static)]
-        objects [to] (string "linking " to "...")))
+  (notail
+    (exec [(c++) (c++std) ;(opt) ;(c++flags) ;(extra-link-paths) "-o" to ;objects ;(rdynamic) "-pthread" ;(libs make-static)]
+          objects [to] (string "linking " to "..."))))
 
 (defn make-archive
   "Make an archive file. Return the command arguments."
   [objects to]
-  (exec [(ar) "rcs" to ;objects] objects [to] (string "archiving " to "...")))
+  (notail
+    (exec [(ar) "rcs" to ;objects] objects [to] (string "archiving " to "..."))))
+
+(defn generic-preprocess
+  "Execute a C generating command as part of the build process. Useful for CJanet or other DSLs."
+  [from to]
+  (notail
+    (exec [(sh/self-exe) "-e" "(put root-env *out* (file/open (get (dyn *args*) 3) :w))" from to]
+          [from] [to]
+          (string "generating C source from " from " to " to "..."))))
 
 # Compound commands
 
@@ -326,6 +347,11 @@
       (do
         (set has-cpp true)
         (array/push cmds-into (compile-c++ source o))
+        (array/push objects o))
+      :janet
+      (let [oc (string o ".c")]
+        (array/push cmds-into (generic-preprocess source oc))
+        (array/push cmds-into (compile-c oc o))
         (array/push objects o))
       # else
       (errorf "unknown source file type for %v" source)))
@@ -541,6 +567,11 @@
       (do
         (array/push cmds-into (msvc-compile-c++ source o))
         (array/push objects o))
+      :janet
+      (let [oc (string o ".c")]
+        (array/push cmds-into (generic-preprocess source oc))
+        (array/push cmds-into (msvc-compile-c oc o))
+        (array/push objects o))
       # else
       (errorf "unknown source file type for %v" source)))
   objects)
@@ -623,7 +654,7 @@
       (flush)
       (exec-linebuffered cmd))
     (do
-      (print message)
+      (unless (dyn :quiet) (print message))
       (with [proc (os/spawn cmd :p {:out :pipe :err :pipe})]
         (def [out err exit] (ev/gather
                               (ev/read (proc :out) :all)
@@ -735,7 +766,7 @@
   (def pkp (string "--with-path=" (path/join pkg-config-path "pkgconfig")))
   (def extra (dyn *pkg-config-flags* []))
   (def output (sh/exec-slurp "pkg-config" wp pkp ;extra ;cmd))
-  (string/split " " (string/trim output)))
+  (filter next (string/split " " (string/trim output))))
 
 (defn pkg-config
   "Setup defines, cflags, and library flags from pkg-config."
