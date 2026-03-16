@@ -36,11 +36,11 @@
 ###
 
 (defn- signal-handler
-  [service sig msg fiber]
+  [service service-name sig msg fiber]
   (def f (get service :logfile))
-  (eprintf "%s from service %s: %.4q" sig service msg)
-  (with-dyns [*err* (get service :logfile)]
-    (debug/stacktrace fiber msg))
+  (eprintf "%s from service %s: %.4q" sig service-name msg)
+  (with-dyns [*err* f]
+    (debug/stacktrace fiber msg ""))
   (put service :last-msg msg)
   (file/flush f))
 
@@ -50,7 +50,7 @@
   (def super (get man :supervisor))
   (def services (get man :services))
   (def services-inverse (get man :services-inverse))
-  # termiate condition allows us to distinguish between an empty manager that is waiting
+  # terminate condition allows us to distinguish between an empty manager that is waiting
   # for services to be added, vs an explicitly canceled one.
   (while (or (next services) (not (get man :terminate)))
     (def [sig fiber task-id] (ev/take super))
@@ -58,7 +58,7 @@
     (def service-name (or task-id (get services-inverse fiber)))
     (when-let [service (get services service-name)]
       (put service :status (fiber/status (get service :fiber)))
-      (protect (signal-handler service-name sig msg fiber)))))
+      (signal-handler service service-name sig msg fiber))))
 
 (defn make-manager
   "Group a number of fibers into a single object for structured concurrency.
@@ -92,13 +92,16 @@
   (def logpath (path/join log-dir (string service-name ".log")))
   (eprint "starting service " service-name " - logs at " logpath)
   (def logfile (file/open logpath :ab))
+  (var wrapper-called false)
+  (def new-env (make-env))
   (defn wrapper
     [service]
+    (set wrapper-called true)
     (setdyn *args* [(string service-name) ;args])
     (setdyn *out* logfile)
     (setdyn *err* logfile)
     (setdyn *pretty-format* "%.5q")
-    (xprintf logfile "started service %s - args: %q" service-name args)
+    (xprintf logfile "========================\nstarted service %s - args: %q" service-name args)
     (file/flush logfile)
     (setdyn *current-service* service)
     (setdyn *current-manager* manager)
@@ -107,11 +110,14 @@
     (put service :env (curenv))
     (put service :started-at (os/time))
     (main-function ;args))
-  (def service @{:name service-name :logfile logfile :main main-function :args args})
-  (def f (ev/go wrapper service (get manager :supervisor)))
-  (put service :fiber f)
+  (def f (fiber/new wrapper :t new-env))
+  (def service @{:name service-name :logfile logfile :logpath logpath :fiber f
+                 :main main-function :args args :completion-channel (ev/thread-chan 1)})
+  (ev/go f service (get manager :supervisor))
   (put (get manager :services) service-name service)
   (put (get manager :services-inverse) service service-name)
+  (ev/sleep 0) # one loop so that wrapper has been called
+  (assert wrapper-called)
   service-name)
 
 (defn stop-service
@@ -128,13 +134,27 @@
   (def logfile (get serv :logfile))
   (def f (get serv :fiber))
   (ev/cancel f reason)
-  (ev/sleep 0)
+  (def completion-channel (get serv :completion-channel))
+  (ev/sleep 0) # cancelation may take longer...
+  (when (pos? (ev/count completion-channel))
+    (try
+      (do
+        (def complete-time (get serv :completion-deadline 1))
+        # take start token
+        (ev/with-deadline 0 (ev/take completion-channel))
+        # take end token with deadline
+        (ev/with-deadline complete-time (ev/take completion-channel)))
+      ([err f]
+       (file/write logfile "no affirmative cancellation response\n")
+       (debug/stacktrace f err ""))))
+  (ev/chan-close completion-channel)
   (file/close logfile)
   nil)
 
 (defn- stop-and-start-service
   "(Re)start a service"
   [service-name restart-after reason]
+  (def service-name (keyword service-name))
   (def manager (get-manager))
   (def services (get manager :services))
   (def services-inverse (get manager :services-inverse))
@@ -155,7 +175,17 @@
 (defn remove-service
   "Remove a service"
   [service-name]
+  (def service-name (keyword service-name))
   (stop-and-start-service service-name false "service stopped for removal")
+  (ev/sleep 0)
+  # Remove from tables
+  (def manager (get-manager))
+  (def services (get manager :services))
+  (def s (get services service-name))
+  (def services-inverse (get manager :services-inverse))
+  (put services service-name nil)
+  (when-let [f (get s :fiber)]
+    (put services-inverse f nil))
   nil)
 
 (defn wait
@@ -170,13 +200,105 @@
     (ev/cancel (get manager :handler) "kill manager")))
 
 ###
+### Definition Helpers
+###
+
+(defn run-subprocess
+  ``
+  Create a service entry function that runs in a subprocess.
+  Example usage:
+
+  (services/add-service :my-service services/run-subprocess "janet-netrepl" "-s")
+  ``
+  [prog & args]
+  (def f (assert (dyn *out*)))
+  (assert (= :core/file (type f)))
+  (var proc nil)
+  (def rc
+    (edefer (if proc (:kill proc))
+      (set proc (os/spawn [prog ;args] :p {:out f :err f}))
+      (os/proc-wait proc)))
+  (when (zero? rc)
+    (print "finished successfully")
+    (do
+      (printf "finished with non-zero exit code: %d" rc)
+      (error (string/format "non-zero exit %d" rc)))))
+
+# TODO - move to ev-utils?
+(defn- thread-with-cancel
+  ```
+  Same as ev/thread, but creates a threaded channel that allows cancelling the fiber inside the thread. There
+  is a fiber A -> thread -> fiber B relationship where cancelling fiber A should also cancel
+  fiber B.
+  ```
+  [after-cancel f]
+  (def cancel-chan (ev/thread-chan))
+  (defn g
+    []
+    (def root (fiber/root))
+     # messages to this thread will cancel the root fiber
+    (ev/go |(do (ev/cancel root (ev/take cancel-chan)) (after-cancel)))
+    (f))
+  (defn body [] (ev/thread g))
+  (def cancel-fib (fiber/new body :ti))
+  (def r (resume cancel-fib))
+  (if (= (fiber/status cancel-fib) :dead)
+    r
+    (do
+      (ev/give cancel-chan r)
+      (propagate r cancel-fib))))
+
+(defn run-module-in-thread
+  ``
+  A service entry function that will run on a module's function on a new thread.
+  Takes the name of a module to import and a function name, and will execute function of that module.
+
+  Example usage:
+
+  (services/add-service :my-service services/run-module-in-thread "spork/netrepl" 'run-server-single)
+  ``
+  [module-name &opt func & args]
+  (default func 'main)
+  (def svc (dyn *current-service*))
+  (def completion-channel (get svc :completion-channel))
+  (ev/give completion-channel :start) # indicate async cancellation
+  (def logpath (get svc :logpath))
+  (prin "starting new thread\n")
+  (flush)
+  (def sp (dyn *syspath*))
+  (def tid (dyn :task-id))
+  (thread-with-cancel |(ev/give completion-channel :done)
+    (fn :thread
+      []
+      # Reopen on the new thread rather than transfer via marshalling
+      (def g (file/open logpath :ab))
+      (try
+        (do
+          (setdyn *err* g)
+          (setdyn *out* g)
+          (setdyn *syspath* sp)
+          (setdyn *pretty-format* "%.5q")
+          (setdyn :task-id tid)
+          # TODO - allow easily setting title of service
+          (def main (module/value (require module-name) (symbol func)))
+          (setdyn *args* [module-name ;args])
+          (main ;(dyn *args*)))
+        ([err f]
+          (debug/stacktrace g err "")
+          (file/flush g) # flush f after making error stack trace
+          (propagate f err)))
+      (xprin g "finished module in thread!\n")
+      (file/flush g))))
+
+###
 ### Reporting
 ###
 
 (defn all-services
   "Get a list of running services"
-  []
-  (keys (get (get-manager) :services)))
+  [&opt manager]
+  (default manager (get-manager))
+  (keys (get manager :services)))
 
 (defn- format-time
   "Convert an integer time since epoch to readable string."
@@ -192,6 +314,14 @@
                  year (inc month) (inc month-day)
                  hours minutes seconds))
 
+(defn- get-title
+  [_ service]
+  (when-let [t (get service :title)]
+    (break t))
+  (when-let [f (get service :fiber)]
+    (when-let [e (fiber/getenv f)]
+      (get e :title))))
+
 (def- service-columns [:name :title :status :last-msg :started-at])
 (def- service-header-map
   {:name "Name"
@@ -200,16 +330,18 @@
    :last-msg "Last Error"
    :started-at "Started At"})
 (def- service-column-map
-  {:started-at (fn [timestamp _row] (format-time timestamp))})
+  {:started-at (fn [timestamp _row] (format-time timestamp))
+   :title get-title})
 
 (defn print-all
   "Print a table of all running services."
-  [&opt filter-fn]
+  [&opt manager filter-fn]
   (default filter-fn (fn [&] true))
-  (def manager (get-manager))
+  (default manager (get-manager))
   (def services (get manager :services))
   (def raw-rows
-    (seq [service-name :in (all-services)]
+    (seq [service-name :in (sort (all-services manager))]
       (get services service-name)))
   (def rows (filter filter-fn raw-rows))
-  (misc/print-table rows service-columns service-header-map service-column-map))
+  (misc/print-table rows service-columns service-header-map service-column-map)
+  (flush))

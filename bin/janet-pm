@@ -129,7 +129,7 @@
     JANET_BUILD_TYPE
         What kind of build to make when building a bundle that has a
         project.janet. Should be "develop", "release", or "debug".
-        Defaults to "release".
+        Defaults to "develop".
 
     JANET_CURL
         Where to get the "curl" command when handling project.janet.
@@ -280,12 +280,14 @@
 
 (defn new-venv
   "Create a new virtual environment"
-  [path]
+  [&opt path]
+  (default path "venv")
   (pm/scaffold-pm-shell path))
 
 (defn new-full-venv
   "Create a new virtual environment, capturing snapshots of the janet interpreter and shared libraries as well."
-  [path]
+  [&opt path]
+  (default path "venv")
   (pm/scaffold-pm-shell path)
   (pm/vendor-binaries-pm-shell path))
 
@@ -314,7 +316,6 @@
    "help" help
    "install" install
    "test" test
-   "help" help
    "deps" deps
    "hook" do-hook
    "env" new-venv
