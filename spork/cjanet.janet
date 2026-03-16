@@ -11,6 +11,10 @@
 ### subset of valid C 99, plus other features that enable C++ integration.
 ###
 
+### TODO
+### [ ] auto generate headers for each typedef and function declaration (optionally)
+### [ ] reserve special forms (do, if, while, etc.) to prevent accidentally trying to call them in function contexts
+
 (import ./cc)
 (import ./pm-config)
 
@@ -25,7 +29,7 @@
   (peg/compile
     ~{:valid (range "az" "AZ" "__" "..")
       :one (+ '"->" (/ "-" "_") '"::" '" " ':valid (/ '(if-not ":" 1) ,|(string "_X" ($ 0))))
-      :main (% (* (? "@") '(any (set "*&")) :one (any (+ ':d :one)) -1))}))
+      :main (% (* '(any (set "*&")) :one (any (+ ':d :one)) -1))}))
 
 (def- mangle-name-peg
   (peg/compile
@@ -102,9 +106,9 @@
   (name type) or name:type as a shorthand. If no type is found, default to dflt-type. dflt-type
   itself defaults to (dyn *default-ctype* 'CJANET_DEFAULT_TYPE')"
   [x &opt dflt-type]
-  (default dflt-type (dyn *default-ctype* "CJANET_DEFAULT_TYPE"))
   # This needs to be defined based on c compiler - "auto" for msvc and c23+, and __auto_type for clang and GCC on older standards
   # Perhaps we should error if unset?
+  (default dflt-type (dyn *default-ctype* "CJANET_DEFAULT_TYPE"))
   (case (type x)
     :tuple [(get x 0) (normalize-type (get x 1))]
     :symbol
@@ -129,7 +133,7 @@
 
 # Macros
 # We need to be judicious with macros as they can obscure real C functions. In practice we can get
-# around this with mangling magic - add a leading "@" to the symbol and it will not match a macro name
+# around this with the "call" expression.
 
 (def- extra-macros @{})
 
@@ -507,8 +511,7 @@
   (prin "while (")
   (emit-expression condition true)
   (prin ") ")
-  (emit-blocks [stm ;body] true)
-  (print))
+  (emit-blocks [stm ;body] true))
 
 (defn- case-literal? [x] (or (symbol? x) (and (number? x) (= x (math/floor x)))))
 
@@ -767,7 +770,6 @@
   (put alias-or-ctype-to-abstract-type alias abstract)
   (put alias-or-ctype-to-abstract-type alias abstract))
 
-
 (each [alias ctype wrapfn getfn optfn abstract] bindgen-table
   (register-binding-type alias ctype wrapfn getfn optfn abstract))
 
@@ -804,8 +806,8 @@
   (if getfn
     ~(def (,v ,ctype) (,getfn ,argv ,n))
     (do
-      (assertf abstract "cannot use type alias %j as C function parameter, call 'register-binding-type' to enable this" T)
-      ~(def (,v ,ctype) (janet-getabstract ,argv ,n (& ,abstract))))))
+      (assert abstract (string/format "cannot use type alias %j as C function parameter, call 'register-binding-type' to enable this" T))
+      ~(def (,v ,ctype) (janet-getabstract ,argv ,n ,abstract)))))
 
 (defn- janet-opt*
   "Get cjanet fragment to extract optional parameters. Similar to non-optional parameters
@@ -823,7 +825,7 @@
     (if optfn
       ~(def (,v ,ctype) (,optfn ,argv ,argc ,n ,dflt))
       (do
-        (assertf abstract "cannot use type alias %j as C function parameter, call 'register-binding-type' to enable this" T)
+        (assert abstract (string/format "cannot use type alias %j as C function parameter, call 'register-binding-type' to enable this" T))
         ~(def (,v ,ctype) (janet-optabstract ,argv ,argc ,n ,abstract ,dflt))))))
 
 (defn emit-abstract-type
@@ -831,10 +833,15 @@
   "Create and register an abstract type for janet. Will also register the abstract type with janet_register_abstract_type"
   (def ats (if-let [x (dyn *abstract-type-list*)] x (setdyn *abstract-type-list* @[])))
   (def name-at (symbol name "_AT"))
-  (array/push ats name-at)
-  (register-binding-type ['* name] ['* name] 'janet-wrap-abstract nil nil name-at)
-  (register-binding-type ['quote name] ['* name] 'janet-wrap-abstract nil nil name-at)
-  (emit-declare [name-at 'JanetAbstractType] :const :static (struct ;fields)))
+  (def name-atp (symbol name "_ATP"))
+  (def fields-dict (struct ;fields))
+  (def registered-name (get fields-dict :name))
+  (assert registered-name "key :name is required for abstract types")
+  (array/push ats [name-at name-atp registered-name])
+  (register-binding-type ['* name] ['* name] 'janet-wrap-abstract nil nil name-atp)
+  (register-binding-type ['quote name] ['* name] 'janet-wrap-abstract nil nil name-atp)
+  (emit-declare [name-at 'JanetAbstractType] :static :const fields-dict)
+  (emit-declare [name-atp '*JanetAbstractType] :static :const ~(& ,name-at)))
 
 (defmacro abstract-type
   "Macro version of emit-abstract-type that allows for top-level unquote"
@@ -916,8 +923,8 @@
   or janet_fixarity).
   ```
   [name & more]
+  #(emit-cfunction name ;more))
   ~(,(make-trampoline name) ,emit-cfunction ,;(qq-wrap [name ;more])))
-#(emit-cfunction name ;more))
 
 (defn emit-cdef
   ```
@@ -951,7 +958,14 @@
   (block
     ,;all-cdefs
     (def (cfuns (array JanetRegExt)) (array ,;all-cfuns JANET_REG_END))
-    ,;(seq [t :in all-types] ~(janet-register-abstract-type (addr ,t)))
+    ,;(seq [[t at-t registered-name] :in all-types]
+        ~(do
+           (def (existing (const *JanetAbstractType)) (janet-get-abstract-type (janet-csymbolv ,registered-name)))
+           (if existing
+             (set ,at-t existing)
+             (do
+               (set ,at-t (& ,t))
+               (janet-register-abstract-type ,at-t)))))
     (janet_cfuns_ext env ,name cfuns)))
 
 (defmacro module-entry
@@ -967,14 +981,14 @@
   ```
   Begin C Janet JIT context. Optionally pass in options to configure compilation. The `options` argument
   will be passed to the `spork/cc` module to compile generated C code. Generated intermediates will be created
-  in the _cjanet/ directory.
+  in the _build/ directory.
   ```
   [&keys options]
   (def compilation-unit @"#include <janet.h>\n")
   (def prevout (dyn *out*))
   (def cont
     {:buffer compilation-unit
-     :build-dir "_cjanet"
+     :build-dir "_build"
      :opts options
      :old-out prevout
      :prefix (get options :prefix)
@@ -982,9 +996,9 @@
      *cdef-list* @[]
      *cfun-list* @[]
      *abstract-type-list* @[]
-     :module-name (get options :module-name (string "cjanet" (gensym) "_" (os/getpid)))})
+     :module-name (get options :module-name (string "cjanet" (gensym) "_" (math/random)))})
   (setdyn *jit-context* cont)
-  (os/mkdir "_cjanet")
+  (os/mkdir "_build")
   (setdyn *out* compilation-unit)
   (setdyn *cdef-list* (get cont *cdef-list*))
   (setdyn *cfun-list* (get cont *cfun-list*))

@@ -6,6 +6,13 @@
 # (@ define STB_TRUETYPE_IMPLEMENTATION)
 (@ define STBIW_WINDOWS_UTF8)
 
+# TODO - point to miniz's zlib implementation for png compression
+
+(@ define STBI_MALLOC janet_malloc)
+(@ define STBI_REALLOC janet_realloc)
+(@ define STBI_FREE janet_free)
+
+(include <janet.h>)
 (include "stb_image.h")
 (include "stb_image_write.h")
 (include "stb_image_resize2.h")
