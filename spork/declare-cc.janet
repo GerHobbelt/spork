@@ -19,7 +19,7 @@
 (defdyn *build-root* "Root build directory that will contain all built artifacts")
 
 (defn- build-root [] (dyn *build-root* "_build"))
-(defn- build-dir [] (path/join (build-root) (dyn cc/*build-type* :release)))
+(defn- build-dir [] (path/join (build-root) (cc/build-type)))
 (defn- get-rules [] (dyn cc/*rules* (curenv)))
 (defn- mkbin [] (def x (path/join (dyn *syspath*) "bin")) (fn :make-bin [] (sh/create-dirs x)))
 (defn- mkman [] (def x (path/join (dyn *syspath*) "man" "man1")) (fn :make-man [] (sh/create-dirs x)))
@@ -180,7 +180,6 @@
   ``Inline raw byte file as a c file. The header file will contain two exported symbols, `(string name "_emded")`, a
     pointer of an array of unsigned char, and `(string name "_embed_size")`, a size_t of the number bytes.``
   [bytes dest name]
-  (def chunks (seq [b :in bytes] (string b)))
   (def lasti (- (length bytes) 1))
   (with [out (file/open dest :wn)]
     (file/write out "#include <stddef.h>\n\nstatic const unsigned char bytes[] = {")
@@ -265,6 +264,7 @@
   [&named name description url version repo tag dependencies]
   (assert name)
   (default dependencies @[])
+  repo version description url tag dependencies # unused
   (def br (build-root))
   (def bd (build-dir))
   (def rules (get-rules))
@@ -310,7 +310,7 @@
   (defn- postclean
     []
     (build-rules/build-run e "post-clean" (dyn :workers)))
-  (defn build [&opt man target]
+  (defn build [&opt _man target]
     (prebuild)
     (default target "build")
     (build-rules/build-run e target (dyn :workers))
@@ -365,7 +365,7 @@
     (rule :pre-install []
           (def manifest (assert (dyn *install-manifest*)))
           (bundle/add-directory manifest prefix)))
-  (each s source
+  (each s sources
     (install-rule s (dest s))))
 
 (defn declare-headers
@@ -416,7 +416,6 @@
   (when (is-win-or-mingw)
     (def absdest (path/join (dyn *syspath*) dest))
     (def bat (string "@echo off\r\ngoto #_undefined_# 2>NUL || title %COMSPEC% & janet \"" absdest "\" %*"))
-    (def newname (string main ".bat"))
     (install-buffer bat (string dest ".bat") nil (mkbin)))
   dest)
 
@@ -456,7 +455,7 @@
   dynamically by a janet runtime. This also builds a static libary that
   can be used to bundle janet code and native into a single executable."
   [&named name source embedded lflags libs cflags
-   c++flags defines install nostatic static-libs
+   c++flags defines nostatic static-libs deps
    use-rpath use-rdynamic pkg-config-flags dynamic-libs msvc-libs
    ldflags # alias for libs
    pkg-config-libs smart-libs c-std c++-std target-os]
@@ -470,6 +469,7 @@
   (default defines @{})
   (default smart-libs false)
   (default msvc-libs @[])
+  (default deps @[])
   (def toolchain (get-toolchain))
 
   (def msvc-libs @[;msvc-libs])
@@ -496,6 +496,7 @@
               cc/*c++-std* c++-std
               cc/*target-os* target-os
               cc/*visit* cc/visit-add-rule
+              build-rules/*implicit-deps* [;deps ;(dyn build-rules/*implicit-deps* [])]
               *toolchain* toolchain
               cc/*rules* rules})
   (table/setproto benv (curenv)) # configurable?
@@ -734,7 +735,7 @@ int main(int argc, const char **argv) {
   (when install (install-rule dest (path/join "bin" name) nil (mkbin) true))
   (def target (if no-compile cimage-dest dest))
   (rule :build [target])
-  (rule target [entry ;headers ;deps]
+  (rule target [entry ;headers ;deps ;(dyn build-rules/*implicit-deps* @[])]
         (print "generating executable c source " cimage-dest " from " entry "...")
         (sh/create-dirs-to dest)
         (flush)
@@ -764,12 +765,11 @@ int main(int argc, const char **argv) {
 
         # Load all native modules
         (def prefixes @{})
-        (def static-libs @[])
         (loop [[name m] :pairs module-cache
                :let [n (m :native)]
                :when n
                :let [prefix (gensym)]]
-          (print "found native " n "...")
+          (print "found native " name " (" n ")...")
           (flush)
           (put prefixes prefix n)
           (array/push static-libs (modpath-to-static toolchain n))
@@ -866,15 +866,17 @@ int main(int argc, const char **argv) {
                     cc/*cflags* [;other-cflags ;cflags]
                     cc/*c++flags* (distinct [;other-cflags ;c++flags])
                     cc/*static-libs* (distinct [;dep-libs ;static-libs])
+                    cc/*dynamic-libs* (distinct [;dynamic-libs])
                     cc/*smart-libs* smart-libs
                     cc/*use-rdynamic* use-rdynamic
                     cc/*use-rpath* use-rpath
-                    cc/*pkg-config-flags* pkg-config-flags
+                    cc/*pkg-config-flags* [;pkg-config-flags ;(if static ["--static"] [])]
                     cc/*c-std* c-std
                     cc/*c++-std* c++-std
                     cc/*cc* (toolchain-to-cc toolchain)
                     cc/*c++* (toolchain-to-c++ toolchain)
                     cc/*target-os* target-os
+                    build-rules/*implicit-deps* [;deps ;(dyn build-rules/*implicit-deps* []) ;headers]
                     cc/*visit* cc/visit-execute-if-stale
                     cc/*rules* (get-rules)})
         (table/setproto benv (curenv)) # configurable?
@@ -941,6 +943,8 @@ int main(int argc, const char **argv) {
   (merge-module e declare-cc)
   (merge-module e cc)
   (merge-module e path)
+  (when (os/stat "project.janet" :mode)
+    (put e build-rules/*implicit-deps* @["project.janet"]))
   # TODO - fake some other functions a bit better as well
   (put e 'default-cflags @{:value @[]})
   (put e 'default-lflags @{:value @[]})

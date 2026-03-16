@@ -52,7 +52,7 @@
   (if (string/find ":" bname) (break bname))
   (let [pkgs (try
                (require "pkgs")
-               ([err]
+               ([_err]
                  (bundle-install-recursive (getpkglist))
                  (require "pkgs")))
         url (get-in pkgs ['packages :value (symbol bname)])]
@@ -130,7 +130,7 @@
 (defn download-tar-bundle
   "Download a dependency from a tape archive. The archive should have exactly one
   top level directory that contains the contents of the project."
-  [bundle-dir url &opt force-gz]
+  [bundle-dir url]
   (def has-gz (string/has-suffix? "gz" url))
   (def is-remote (string/find ":" url))
   (def dest-archive (if is-remote (string bundle-dir "/bundle-archive." (if has-gz "tar.gz" "tar")) url))
@@ -333,7 +333,7 @@
 
 (defn save-lockfile
   "Create a lockfile that can be used to reinstall all currently installed bundles at a later date."
-  [lock-dest &opt allow-local]
+  [lock-dest]
   (def lock @[])
   (each b (bundle/topolist)
     (def manifest (bundle/manifest b))
@@ -370,7 +370,7 @@
 ### Generate new projects quickly, ported from jpm
 ###
 
-(def- template-peg
+(def- template-peg :flycheck
   "Extract string pieces to generate a templating function"
   (peg/compile
     ~{:sub (group
@@ -390,7 +390,7 @@
       :string (array/push string-args (string ;chunk))
       :array (each sym chunk
                (array/push string-args ~(,get opts ,(keyword (first sym)))))))
-  ~(fn [opts] (,string ,;string-args)))
+  ~(fn [opts] opts (,string ,;string-args)))
 
 (defmacro deftemplate
   ```
@@ -660,7 +660,7 @@
 
 (deftemplate enter-shell-template
   :private
-    ````
+  ````
     # . bin/activate
     if [ -n "$${_OLD_JANET_PATH+set}" ]; then
       echo 'An environment is already active, please run `deactivate` first.';
@@ -678,6 +678,7 @@
       export JANET_PATH;
       export PATH;
       export PS1;
+      hash -r 2> /dev/null;
       deactivate() {
         PATH="$$_OLD_PATH";
         if [ -n "$$_OLD_JANET_PATH_SET" ]; then
@@ -699,7 +700,7 @@
         export _OLD_PS1;
         hash -r 2> /dev/null;
       }
-    fi
+    fi;
     hash -r 2> /dev/null;
     ````)
 
@@ -770,10 +771,10 @@
   (print "(Unix sh)    run `. " path "/bin/activate` to enter the new environment, then `deactivate` to exit."))
 
 (defn- try-copy
-    [src dest]
-    (unless (sh/exists? src) (break false))
-    (sh/copy src dest)
-    true)
+  [src dest]
+  (unless (sh/exists? src) (break false))
+  (sh/copy src dest)
+  true)
 
 (defn vendor-binaries-pm-shell
   ```

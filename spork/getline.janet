@@ -138,7 +138,7 @@
     (buffer/format tmp-buf "\r%s%s%s\e[0K\r" prpt pad view)
     # Different implementations may behave inconsistently regarding to "move 0 column".
     (if (not (= 0 visual-pos))
-      (buffer/format-at tmp-buf -1 "\e[%dC"  visual-pos))
+      (buffer/format-at tmp-buf -1 "\e[%dC" visual-pos))
     (flushs))
 
   (defn- history-move
@@ -348,11 +348,13 @@
             13 # enter
             (do (set more-input false) (buffer/push buf "\n") (clear-lines))
             14 # ctrl-n
-            (set hindex (history-move hindex -1))
-            16 # ctrl-p
             (set hindex (history-move hindex 1))
+            16 # ctrl-p
+            (set hindex (history-move hindex -1))
             17 # ctrl-q
             (do (set more-input false) (set ret-value :cancel) (clear-lines))
+            21 # ctrl-u
+            (do (buffer/blit buf buf 0 pos) (buffer/popn buf pos) (set pos 0) (clear-lines) (refresh))
             23 # ctrl-w
             (kbackw)
             26 # ctrl-z
@@ -363,7 +365,7 @@
               (let [c3 (getc)]
                 (cond
                   (and (>= c3 (chr "0")) (<= c3 (chr "9")))
-                  (case (def c4 (getc))
+                  (case (getc)
                     (chr "1") (khome)
                     (chr "3") (kdelete)
                     (chr "4") (kend)
